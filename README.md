@@ -1,270 +1,144 @@
-# ATPL Companion v1
+# ATPL Companion
 
-> A production-style RAG application over ATPL (Airline Transport Pilot Licence) study materials — built to break coursework habits and learn what production retrieval actually looks like.
+An AI study assistant for ATPL (Airline Transport Pilot Licence) exam preparation. Ask it questions in plain English, get cited answers straight from the study material.
 
-![Next.js](https://img.shields.io/badge/Next.js_14-black?style=flat-square&logo=next.js)
+Built as a learning project to move from tutorial-style code to production patterns.
+
+---
+
+## What it does
+
+You type a question. It searches your ATPL study PDFs, finds the most relevant passages, and gives you a cited answer — with a reference to the exact page it came from.
+
+![Stack](https://img.shields.io/badge/Next.js_14-black?style=flat-square&logo=next.js)
 ![Qdrant](https://img.shields.io/badge/Qdrant-Cloud-crimson?style=flat-square)
 ![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o-green?style=flat-square)
-![Cohere](https://img.shields.io/badge/Cohere-Rerank_v3.5-coral?style=flat-square)
-![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue?style=flat-square)
+![Cohere](https://img.shields.io/badge/Cohere-Rerank-coral?style=flat-square)
 
 ---
 
-## The Problem
-
-ATPL syllabi span 14 subjects across thousands of pages of dense technical material — aerodynamics, meteorology, air law, navigation, human performance. Exam questions test exact values: altitudes to the foot, temperatures to the degree, regulation numbers.
-
-Standard search fails here. A question like *"what is the relationship between TAS, IAS, and density altitude at FL350?"* needs retrieval that understands semantics (dense vectors) **and** exact ICAO terminology (sparse BM25). And after retrieval, you need a reranker to surface the three right paragraphs from fifty candidates — not hallucinate an answer.
-
-I'm studying for my ATPL. So I built the tool I actually needed, and used it as a forcing function to replace every coursework shortcut with a production pattern.
-
----
-
-## Architecture
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    INGESTION PIPELINE                        │
-│                    (local, one-time)                         │
-│                                                              │
-│  PDF files                                                   │
-│     │                                                        │
-│     ▼                                                        │
-│  pdf-parse ──► per-page text extraction                      │
-│     │                                                        │
-│     ▼                                                        │
-│  Recursive chunker                                           │
-│  (512 tok target · 64 tok overlap)                           │
-│     │                                                        │
-│     ├──► Build corpus TF-IDF vocab ──► vocab.json + idf.json │
-│     │                                                        │
-│     ▼                                                        │
-│  OpenAI text-embedding-3-small                               │
-│  (1536-dim dense vectors)                                    │
-│     │                                                        │
-│     ▼                                                        │
-│  Qdrant Cloud upsert                                         │
-│  {dense vector, sparse TF-IDF vector,                        │
-│   payload: {source, page, chunkIndex, text}}                 │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-                    [Qdrant Cloud]
-                          │
-┌─────────────────────────▼───────────────────────────────────┐
-│                    QUERY PIPELINE                            │
-│                 (Next.js API route)                          │
-│                                                              │
-│  User question                                               │
-│     │                                                        │
-│     ├──► OpenAI embed ──► dense query vector                 │
-│     └──► vocab lookup ──► sparse query vector                │
-│                                                              │
-│  Qdrant prefetch:                                            │
-│     ├── dense cosine    top-50                               │
-│     └── sparse BM25     top-50                               │
-│            │                                                 │
-│            ▼                                                 │
-│     Qdrant RRF fusion ──► unified top-50                     │
-│            │              (single round-trip)                │
-│            ▼                                                 │
-│     Cohere Rerank v3.5 ──► top-5                             │
-│            │                                                 │
-│            ▼                                                 │
-│     GPT-4o streaming                                         │
-│     (system prompt: cite every claim as [source:page])       │
-│            │                                                 │
-│            ▼                                                 │
-│     SSE stream ──► sources panel + streaming answer          │
-└─────────────────────────────────────────────────────────────┘
+Your question
+     │
+     ▼
+Search study material two ways:
+  - Meaning-based search (finds similar concepts)
+  - Keyword search (finds exact terms like "FL350" or "QNH")
+     │
+     ▼
+Combine and rerank the best results
+     │
+     ▼
+GPT-4o reads the top passages and writes an answer
+with [source:page] citations on every fact
+     │
+     ▼
+Answer streams to your screen in real time
 ```
 
 ---
 
-## Chunking Strategy
+## Tech stack
 
-**Choice: recursive paragraph → sentence splitter, 512 tokens target, 64 token overlap**
-
-### Why not fixed-character splitting?
-
-ATPL material mixes dense prose (weather theory), structured lists (ICAO limits), and formula-heavy sections (navigation). Fixed-character splits bisect sentences mid-concept. A paragraph-first approach keeps the "smallest coherent unit" intact.
-
-### Why 512 tokens?
-
-`text-embedding-3-small` was trained on 8192-token context but retrieval quality degrades for long inputs on specific factual tasks. 512 tokens ≈ 2–3 dense paragraphs — in ATPL material that typically covers one complete concept: one regulation, one formula with its conditions, one weather phenomenon.
-
-Smaller chunks (256 tokens) lose the surrounding context that disambiguates jargon. *"Critical altitude"* means different things in engine performance vs. pressurisation. Without the surrounding sentences, the embedding drifts.
-
-### Why 64-token overlap?
-
-Prevents a concept split across a chunk boundary from being un-retrievable. 64 tokens ≈ 2–3 sentences — enough to capture a definition that starts at the bottom of one chunk and continues at the top of the next.
-
-### Why not semantic/embedding-based splitting?
-
-Requires embedding every candidate split point — expensive and slow for large corpora. The content structure (paragraphs already encode topic boundaries) makes it unnecessary here.
-
----
-
-## Retrieval Pipeline
-
-| Step | What happens | Why |
+| What | Tool | Why |
 |---|---|---|
-| **Dense retrieval** | Query embedded with `text-embedding-3-small`, cosine search, top-50 | Catches semantic similarity: paraphrased questions still find the right passage |
-| **Sparse retrieval** | Query tokenised → vocab lookup → BM25-weighted vector, top-50 | Catches exact ICAO codes, altitude values, regulation numbers — critical for ATPL where exact values are tested |
-| **RRF fusion** | Qdrant fuses both ranked lists with Reciprocal Rank Fusion | Single round-trip. No client-side merge logic. Handles list-length asymmetry correctly |
-| **Cohere Rerank v3.5** | Cross-encoder reads (query, passage) pairs jointly, returns top-5 | Cross-encoder quality at API-call cost. Filters surface matches that aren't actually relevant. Adds ~150ms, removes ~35–40% of retrieval noise |
-| **GPT-4o streaming** | System prompt forces `[source:page]` citation on every factual claim | Citations are non-negotiable for a study tool. Wrong answers with no citations are worse than no answers |
+| Frontend | Next.js 14 + Tailwind | Simple, deploys easily to Vercel |
+| Vector database | Qdrant Cloud | Stores the study material as searchable vectors |
+| Embeddings | OpenAI text-embedding-3-small | Converts text into numbers the search can use |
+| LLM | GPT-4o | Writes the final answer |
+| Reranker | Cohere Rerank v3.5 | Picks the best 5 passages from the top 50 results |
 
 ---
 
-## What I Dropped From My Coursework Version (and Why)
+## What I learned building this
 
-This project was a deliberate break from patterns I'd normalised in coursework. Here's the honest accounting:
+### Chunking (splitting the PDFs into pieces)
 
-### LangChain
+Before searching, every PDF gets split into ~512-token chunks (roughly 2–3 paragraphs). Each chunk overlaps slightly with the next so concepts don't get cut off mid-sentence.
 
-**What I used it for:** `RetrievalQA` chain, prompt templates, text splitters.
+Why this size? Small enough that each chunk covers one idea. Big enough that the idea has enough context to be understood on its own.
 
-**Why I dropped it:** LangChain hides the prompt, hides the chunking logic, and hides the retrieval call. When retrieval quality is bad, you can't see why. When the prompt produces wrong citations, you can't see the prompt. It broke across two minor version bumps during a single project. The abstraction adds zero value over calling the OpenAI SDK directly — it just adds a dependency and an indirection layer.
+### Hybrid search
 
-**What I replaced it with:** Direct `openai` SDK. The system prompt is a string I wrote and can read. The chunker is 60 lines I understand. Retrieval is one function call.
+Most beginner RAG tutorials use only one type of search — semantic (meaning-based). This one uses two:
 
-### Firebase
+- **Dense search** — finds passages with similar meaning, even if they use different words
+- **Sparse search (BM25)** — finds exact keyword matches
 
-**What I used it for:** Storing embeddings in Firestore documents, computing cosine similarity in Python at query time.
+Both matter for ATPL. Semantic search handles conceptual questions. BM25 handles exact terms like regulation numbers, altitudes, and ICAO codes that the exam tests verbatim.
 
-**Why I dropped it:** Firebase has no vector operations. The coursework hack was O(n) per query — every query scans every document. At 5,000 chunks it was already slow. The read costs were $0.06 per 10k reads, unsuitable beyond toy scale. It was the wrong tool being forced into a use case it doesn't support.
+### Reranking
 
-**What I replaced it with:** Qdrant Cloud. Purpose-built for vectors. Free tier: 1GB storage. Supports both dense and sparse vectors natively, with RRF fusion inside the database — no client-side logic needed.
-
-### LLM temperature 0.7
-
-**What I used:** Default temperature from tutorial code.
-
-**Why I dropped it:** ATPL answers are factual. Temperature 0.7 produces fluent but occasionally wrong interpolations — the model invents plausible-sounding altitudes and regulation numbers with confidence. For a study tool that's actively harmful.
-
-**What I replaced it with:** Temperature 0.1. Answers are deterministic and conservative. If the model isn't sure, it says so.
-
-### Stuffing all retrieved chunks into context
-
-**What I used:** Top-20 chunks passed directly to the LLM.
-
-**Why I dropped it:** 20 chunks × 512 tokens = 10k tokens of context minimum. GPT-4o handles it but: (a) costs more, (b) "lost in the middle" — recall degrades for passages in the middle of long contexts, (c) noisy context makes the LLM hedge and produce weaker answers.
-
-**What I replaced it with:** Retrieve 50, rerank to 5, send 5. The reranker does the filtering work that the LLM shouldn't have to do.
+After getting 50 candidates from search, a reranker reads each one alongside the question and re-scores them. This step catches passages that matched on surface words but aren't actually useful.
 
 ---
 
-## Stack
+## What I dropped from my earlier (tutorial) version
 
-| Layer | Choice | Notes |
-|---|---|---|
-| Frontend | Next.js 14 App Router + Tailwind | SSE streaming via `ReadableStream` |
-| Deployment | Vercel | Zero config for Next.js |
-| Vector DB | Qdrant Cloud (free tier) | Hybrid search, RRF fusion, native sparse vectors |
-| Embeddings | OpenAI `text-embedding-3-small` | $0.02/1M tokens. 1536 dimensions |
-| LLM | OpenAI GPT-4o streaming | Direct `openai` SDK. No wrapper |
-| Reranker | Cohere Rerank v3.5 | Free tier. Cross-encoder quality |
-| **Not used** | LangChain, LlamaIndex, Firebase, Pinecone | Deliberate omissions — see above |
+| Old habit | Why I dropped it |
+|---|---|
+| LangChain | Hides what the code actually does. Hard to debug when results are wrong. |
+| Firebase as a vector store | Firebase isn't built for this — it required scanning every document per query. Very slow and expensive. |
+| Temperature 0.7 | ATPL exams test exact values. A "creative" LLM invents wrong numbers confidently. Switched to 0.1. |
+| Passing all 20 results to the LLM | More context isn't always better. Noisy context makes answers worse. Now: retrieve 50, rerank to 5, send 5. |
 
 ---
 
 ## Setup
 
-### Prerequisites
-
+**You'll need:**
 - Node.js 20+
-- [Qdrant Cloud](https://cloud.qdrant.io) account (free tier)
-- OpenAI API key
-- [Cohere](https://cohere.com) API key (free tier)
-
-### Environment
+- A free [Qdrant Cloud](https://cloud.qdrant.io) account
+- An [OpenAI](https://platform.openai.com) API key
+- A free [Cohere](https://cohere.com) API key
 
 ```bash
-cp .env.local.example .env.local
-# Fill in:
-# OPENAI_API_KEY
-# QDRANT_URL      (e.g. https://xxxx.eu-central-1-0.aws.cloud.qdrant.io)
-# QDRANT_API_KEY
-# COHERE_API_KEY
-```
-
-### Install
-
-```bash
+# 1. Clone and install
+git clone https://github.com/bbm0r/atpl-companion.git
+cd atpl-companion
 npm install
-```
 
-### Ingest your PDFs
+# 2. Add your keys
+cp .env.local.example .env.local
+# Fill in OPENAI_API_KEY, QDRANT_URL, QDRANT_API_KEY, COHERE_API_KEY
 
-```bash
-# Place PDFs in ./pdfs/
+# 3. Set up the database and ingest your PDFs
+# Place your PDF files in ./pdfs/
+npm run create-collection
+npm run ingest
 
-npm run create-collection   # one-time: creates Qdrant collection
-npm run ingest              # PDF → chunks → embed → upsert
-```
-
-The ingest script outputs `docs/vocab.json` and `docs/idf.json` — commit these, they're needed at runtime for query-side sparse vectors.
-
-### Run locally
-
-```bash
+# 4. Run it
 npm run dev
 # → http://localhost:3000
 ```
 
-### Generate synthetic study material (for testing without real PDFs)
-
+**No PDFs?** Generate synthetic ATPL study material for testing:
 ```bash
-npm run generate-pdfs   # creates 5 synthetic ATPL PDFs in ./pdfs/
+npm run generate-pdfs
 npm run ingest
 ```
 
 ---
 
-## Cost (free-tier operation)
-
-| Service | Free tier | Expected usage |
-|---|---|---|
-| Qdrant Cloud | 1GB storage | ~200MB for full ATPL corpus |
-| OpenAI embeddings | ~$0.02/1M tokens | ~500k tokens to ingest full corpus ≈ $0.01 |
-| Cohere Rerank | Trial → Production (free for dev) | ~5 calls per query |
-| OpenAI GPT-4o | Pay per use | ~$0.005 per question |
-
----
-
-## Skills Demonstrated
-
-- **Production-ready RAG systems:** hybrid retrieval, reranking, source citation, streaming — without framework wrappers
-- **Vector database integration:** Qdrant Cloud collection design, sparse + dense indexing, RRF fusion queries
-- **Retrieval quality engineering:** chunking strategy decisions with measurable rationale, reranker integration, prompt design for factual grounding
-- **Direct SDK usage:** OpenAI, Cohere, Qdrant — no LangChain, no abstraction layers
-
----
-
-## File Structure
+## Project structure
 
 ```
 atpl-companion/
 ├── scripts/
-│   ├── create-collection.ts       # one-time Qdrant collection setup
-│   ├── ingest.ts                  # PDF → chunks → embed → upsert
-│   └── generate-synthetic-pdfs.ts # test data generator
+│   ├── create-collection.ts    # set up the Qdrant database
+│   ├── ingest.ts               # load PDFs into the database
+│   └── generate-synthetic-pdfs.ts
 ├── src/
 │   ├── app/
-│   │   ├── page.tsx               # single-page UI
-│   │   ├── layout.tsx
-│   │   ├── globals.css
-│   │   └── api/ask/route.ts       # hybrid retrieval + rerank + stream
-│   ├── components/
-│   │   └── SourcesPanel.tsx
-│   ├── lib/
-│   │   ├── chunker.ts             # recursive splitter with overlap
-│   │   ├── embed.ts               # OpenAI embeddings
-│   │   ├── qdrant.ts              # typed Qdrant client + hybrid search
-│   │   ├── rerank.ts              # Cohere rerank with graceful fallback
-│   │   └── sparse.ts              # TF-IDF sparse vector builder
-│   └── types/index.ts
-├── docs/                          # generated vocab/IDF (committed — needed at runtime)
-├── pdfs/                          # your PDFs go here (gitignored)
+│   │   ├── page.tsx            # the UI
+│   │   └── api/ask/route.ts    # the search + answer logic
+│   └── lib/
+│       ├── chunker.ts          # splits PDFs into pieces
+│       ├── embed.ts            # converts text to vectors
+│       ├── qdrant.ts           # talks to the vector database
+│       ├── rerank.ts           # re-scores search results
+│       └── sparse.ts           # keyword search vectors
 └── .env.local.example
 ```
